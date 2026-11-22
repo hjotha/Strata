@@ -3751,6 +3751,13 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
     piece by piece and only the damaged pieces are written again, then it is checked a second time.
     `also`: other SHA-256 values that are the same file for Strata's purposes."""
+    if s.with_name(s.name + ".hfstream").exists():
+        # --hf-stream-vram: collar has written a full-size sparse prefix with the header and the non-expert
+        # tensors the pack needs, and the engine completes the shard over HTTP Range before serving.  Hashing
+        # 55 GB of sparse zeros costs minutes and proves nothing about the bytes the pack reads.
+        warn(f"{s.name}: a streamed prefix (--hf-stream-vram); the engine completes it over HTTP Range, so the "
+             f"pinned SHA-256 check is skipped")
+        return
     m = s.with_name(s.name + ".done")
     kept = mark_text(s)
     if kept is not None and any(f"sha256 {x}" in kept for x in (sha, *also)):
