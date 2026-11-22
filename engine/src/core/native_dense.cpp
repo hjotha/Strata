@@ -7,6 +7,7 @@
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/core/hf_stream.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -177,6 +178,18 @@ std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
     for (auto& th : pool) th.join();
     return out;
 }
+// An opt-in HF stream owns the file being written; `tensor_data` would map the sparse holes as zeros.  Read the
+// requested tensor bytes through the stream instead.  Without a stream this is the same memcpy as before.
+bool tensor_bytes(const strata::GgufFile& gguf, const strata::TensorInfo& t, uint64_t skip, void* dst, uint64_t n,
+                  std::string& err) {
+    if (strata::core::hf_stream_active(gguf.path())) {
+        if (!strata::core::hf_stream_read(gguf.path(), gguf.data_start() + t.offset + skip, dst, n, err)) return false;
+        return true;
+    }
+    std::memcpy(dst, gguf.tensor_data(t) + skip, (size_t) n);
+    return true;
+}
+
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -420,9 +433,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (next != offsets.end() && bytes > *next - tensor.offset) {
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
-                // the uploads below read these: ask for them now so the reads overlap
+                // the uploads below read these: ask for them now so the reads overlap (a stream has its own workers)
                 if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
-                    strata::kernels::native_mmvq_supported(tensor.type))
+                    strata::kernels::native_mmvq_supported(tensor.type) &&
+                    !strata::core::hf_stream_active(gguf.path()))
                     strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
             for (const auto& tensor : gguf.tensors()) {
@@ -439,7 +453,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
                     const uint64_t n = (uint64_t) ref.ne0 * (uint64_t) ref.ne1;
-                    const std::vector<uint8_t> q8 = q8_0_of_bf16((const uint16_t*) gguf.tensor_data(tensor), n);
+                    std::vector<uint8_t> bf16;
+                    const uint16_t* src = (const uint16_t*) gguf.tensor_data(tensor);
+                    if (strata::core::hf_stream_active(gguf.path())) {
+                        bf16.resize((size_t) (n * 2));
+                        if (!tensor_bytes(gguf, tensor, 0, bf16.data(), bf16.size(), err)) return false;
+                        src = (const uint16_t*) bf16.data();
+                    }
+                    const std::vector<uint8_t> q8 = q8_0_of_bf16(src, n);
                     void* allocation = nullptr;
                     auto status = cudaMalloc(&allocation, q8.size());
                     DevicePtr data(allocation);
@@ -468,8 +489,13 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status == cudaSuccess)
+                if (status == cudaSuccess && strata::core::hf_stream_active(gguf.path())) {
+                    std::vector<uint8_t> stage((size_t) bytes);
+                    if (!tensor_bytes(gguf, tensor, 0, stage.data(), bytes, err)) return false;
+                    status = cudaMemcpy(data.get(), stage.data(), bytes, cudaMemcpyHostToDevice);
+                } else if (status == cudaSuccess) {
                     status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
+                }
                 if (status != cudaSuccess) {
                     err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
                 }
@@ -489,9 +515,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
                     strata::kernels::native_q8_0_packed_enabled() &&
                     strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
-                    std::vector<uint8_t> host(bytes);
-                    strata::kernels::native_q8_0_pack_host(gguf.tensor_data(tensor), host.data(), (int) ref.ne0,
-                                                           (int) ref.ne1);
+                    std::vector<uint8_t> host(bytes), source;
+                    const uint8_t* src = gguf.tensor_data(tensor);
+                    if (strata::core::hf_stream_active(gguf.path())) {
+                        source.resize((size_t) bytes);
+                        if (!tensor_bytes(gguf, tensor, 0, source.data(), bytes, err)) return false;
+                        src = source.data();
+                    }
+                    strata::kernels::native_q8_0_pack_host(src, host.data(), (int) ref.ne0, (int) ref.ne1);
                     void* packed_allocation = nullptr;
                     auto packed_status = cudaMalloc(&packed_allocation, bytes);
                     packed.reset(packed_allocation);
@@ -537,11 +568,20 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                     const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
                     void* p = nullptr;
-                    std::vector<uint8_t> q8;
-                    if (f32_inject) q8 = q8_0_of((const float*) gguf.tensor_data(tensor), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    std::vector<uint8_t> source, q8;
+                    if (f32_inject) {
+                        source.resize((size_t) ((uint64_t) ref.ne0 * (uint64_t) ref.ne1 * 4));
+                        if (!tensor_bytes(gguf, tensor, 0, source.data(), source.size(), err)) return false;
+                        q8 = q8_0_of((const float*) source.data(), (uint64_t) ref.ne0 * (uint64_t) ref.ne1);
+                    } else if (strata::core::hf_stream_active(gguf.path())) {
+                        source.resize((size_t) bytes);
+                        if (!tensor_bytes(gguf, tensor, 0, source.data(), bytes, err)) return false;
+                    }
+                    const void* src = f32_inject ? (const void*) q8.data()
+                                                 : (source.empty() ? (const void*) gguf.tensor_data(tensor)
+                                                                   : (const void*) source.data());
                     if (cudaMalloc(&p, bytes) != cudaSuccess ||
-                        cudaMemcpy(p, f32_inject ? (const void*) q8.data() : gguf.tensor_data(tensor), bytes,
-                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        cudaMemcpy(p, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
                     ref.hc_q8 = p;

@@ -1856,7 +1856,8 @@ bool FileExpertSource::open_gguf(std::string& err) {
                 }
                 void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
                 if (view == MAP_FAILED) { ::close(fd); err = "FileExpertSource: cannot map " + path; return false; }
-                advise_mapped_experts(view, (size_t) st.st_size, path);
+                if (!hf_stream_active(path)) advise_mapped_experts(view, (size_t) st.st_size, path);
+                else std::fprintf(stderr, "strata: expert source: %s is still arriving (--hf-stream-vram)\n", path.c_str());
                 m.fd = fd;
                 m.bytes = (uint64_t) st.st_size;
                 m.base = (const uint8_t*) view;
@@ -5005,6 +5006,38 @@ const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) co
 }
 
 const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
+    // --hf-stream-vram: the GGUF is still being written.  The profile fill asks for a blob and copies it to VRAM at
+    // once, so one reused buffer is enough; the bytes come from the chunk that just arrived, not from the sparse map.
+    if (hf_stream_any() && !gguf_.empty() && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
+        Span sp[3];
+        const int ns = spans(layer, expert, sp);
+        bool streamed = false;
+        for (int i = 0; i < ns && !streamed; ++i) {
+            const int f = role_ptr_.empty() ? 0 : role_file_[(size_t) (3 * layer + i)];
+            streamed = f >= 0 && f < (int) paths_.size() && hf_stream_active(paths_[(size_t) f]);
+        }
+        if (streamed) {
+            std::lock_guard<std::mutex> lock(hf_mu_);
+            if (hf_blob_.size() < layer_blob_bytes_[(size_t) layer]) hf_blob_.resize((size_t) layer_blob_bytes_[(size_t) layer]);
+            for (int i = 0; i < ns; ++i) {
+                const int f = role_ptr_.empty() ? 0 : role_file_[(size_t) (3 * layer + i)];
+                std::string error;
+                if (f >= 0 && f < (int) paths_.size() && hf_stream_active(paths_[(size_t) f])) {
+                    if (!hf_stream_read(paths_[(size_t) f], sp[i].off, hf_blob_.data() + sp[i].at, sp[i].n, error)) {
+                        static std::atomic<bool> said{false};
+                        if (!said.exchange(true))
+                            std::fprintf(stderr, "strata: hf-stream expert read: %s\n", error.c_str());
+                        return nullptr;
+                    }
+                } else {
+                    std::memcpy(hf_blob_.data() + sp[i].at, sp[i].p, (size_t) sp[i].n);
+                }
+            }
+            file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            ++reads_;
+            return hf_blob_.data();
+        }
+    }
     if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
         if (complement_ready_ && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -5018,6 +5051,9 @@ const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
 }
 
 int FileExpertSource::blob_parts(int64_t layer, int64_t expert, BlobPart* out) {
+    if (hf_stream_any())
+        for (const auto& path : paths_)
+            if (hf_stream_active(path)) return 0;   // the parts are in a file still being written: take blob_stable
     // the GGUF mapped in place only (three tensors per expert); the RAM copy, an exchange override, the unbuffered
     // reads, a closed mapping and the I/O prefetch (STRATA_IO_PREFETCH: it preads the ranges the page cache lacks, which a copy out
     // of the mapping would fault in one page at a time) keep going through blob(), which knows them

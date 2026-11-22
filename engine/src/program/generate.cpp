@@ -59,6 +59,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/hf_stream.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -806,6 +807,16 @@ struct Options {
     /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
     /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
     std::string native_preset;
+    /// Opt-in: stream the metadata shard from a Hugging Face/HTTP URL into --native's path while the engine reads
+    /// it.  This is the same problem beellama's `--hf-stream-vram` solves: a download followed by a second pass over
+    /// the file.  Here the dense upload, the native head and the expert profile fill consume the bytes as they
+    /// arrive, and the disk copy is written alongside (unless the mode is `none`).
+    bool hf_stream_vram = false;
+    std::string hf_stream_url;
+    std::string hf_stream_token;
+    int hf_stream_threads = 8;
+    int hf_stream_chunk_mb = 8;
+    std::string hf_stream_disk_mode = "sync";   ///< sync (default), background (same I/O thread), none
     /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
     std::string embd_gguf;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
@@ -1238,6 +1249,14 @@ void usage() {
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
+                 "  --hf-stream-vram     with --native and --hf-stream-url: fetch the metadata shard over HTTP Range\n"
+                 "                       as the engine loads it (dense, head and expert cache fill read the arriving\n"
+                 "                       bytes), writing the GGUF to --native's path unless --hf-stream-disk-mode none\n"
+                 "  --hf-stream-url URL  the Hugging Face `resolve` URL of --native's GGUF (redirects followed)\n"
+                 "  --hf-stream-threads N  parallel HTTP Range connections (default 8, 1..32)\n"
+                 "  --hf-stream-chunk-mb N  one Range request and staging buffer, MiB (default 8, 1..64)\n"
+                 "  --hf-stream-disk-mode MODE  sync (default), background or none\n"
+                 "  --hf-stream-token T  bearer token for huggingface.co (default: HF_TOKEN)\n"
                  "  --native SHARD1      every full-context native path at once (plan v0.3 P1): stream-token,\n"
                  "                       GR MMVF, BF16, head, dense + PLE key, MoE combine, GDN, router, QSA,\n"
                  "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
@@ -3852,6 +3871,27 @@ int main(int argc, char** argv) {
         else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--native") o.native_preset = next("--native");
+        else if (a == "--hf-stream-vram") o.hf_stream_vram = true;
+        else if (a == "--hf-stream-url") o.hf_stream_url = next("--hf-stream-url");
+        else if (a == "--hf-stream-token") o.hf_stream_token = next("--hf-stream-token");
+        else if (a == "--hf-stream-threads") {
+            const int n = std::atoi(next("--hf-stream-threads"));
+            if (n < 1 || n > 32) { std::fprintf(stderr, "strata generate: --hf-stream-threads expects 1..32\n"); return 2; }
+            o.hf_stream_threads = n;
+        }
+        else if (a == "--hf-stream-chunk-mb") {
+            const int n = std::atoi(next("--hf-stream-chunk-mb"));
+            if (n < 1 || n > 64) { std::fprintf(stderr, "strata generate: --hf-stream-chunk-mb expects 1..64\n"); return 2; }
+            o.hf_stream_chunk_mb = n;
+        }
+        else if (a == "--hf-stream-disk-mode") {
+            const std::string v = next("--hf-stream-disk-mode");
+            if (v != "sync" && v != "background" && v != "none") {
+                std::fprintf(stderr, "strata generate: --hf-stream-disk-mode expects sync, background or none\n");
+                return 2;
+            }
+            o.hf_stream_disk_mode = v;
+        }
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
         else if (a == "--embd-gguf") o.embd_gguf = next("--embd-gguf");
         else if (a == "--native-dense-gguf") o.native_dense_gguf.push_back(next("--native-dense-gguf"));
@@ -4175,6 +4215,27 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+        }
+    }
+    {   // STRATA_HF_STREAM_*: the serving config can carry the settings in its `env` map, so a recipe does not have to
+        // edit the engine's argv.  An explicit flag wins over the environment.
+        if (!o.hf_stream_url.empty() || (std::getenv("STRATA_HF_STREAM_URL") && std::getenv("STRATA_HF_STREAM_URL")[0])) {
+            if (const char* v = std::getenv("STRATA_HF_STREAM"); v && (std::strcmp(v, "1") == 0 || std::strcmp(v, "on") == 0))
+                o.hf_stream_vram = true;
+            if (o.hf_stream_url.empty()) o.hf_stream_url = std::getenv("STRATA_HF_STREAM_URL");
+            if (o.hf_stream_token.empty())
+                if (const char* t = std::getenv("STRATA_HF_STREAM_TOKEN")) o.hf_stream_token = t;
+            if (const char* n = std::getenv("STRATA_HF_STREAM_THREADS")) {
+                const int v = std::atoi(n);
+                if (v >= 1 && v <= 32) o.hf_stream_threads = v;
+            }
+            if (const char* n = std::getenv("STRATA_HF_STREAM_CHUNK_MB")) {
+                const int v = std::atoi(n);
+                if (v >= 1 && v <= 64) o.hf_stream_chunk_mb = v;
+            }
+            if (const char* m = std::getenv("STRATA_HF_STREAM_DISK_MODE"))
+                if (std::strcmp(m, "sync") == 0 || std::strcmp(m, "background") == 0 || std::strcmp(m, "none") == 0)
+                    o.hf_stream_disk_mode = m;
         }
     }
     {   // --ram-keep-gib W (or STRATA_RAM_KEEP_GIB, for a program that cannot pass the flag; the flag wins): the RAM to leave free.  It also
@@ -4955,6 +5016,38 @@ int main(int argc, char** argv) {
         if (n > 0 && n < o.adapt_every && wr > 0) { o.adapt_warm_every = n; o.adapt_warm_rounds = wr; }
     }
     strata::core::layer_set_shared_early(!o.shared_late);
+    if (o.hf_stream_vram) {
+        if (!strata::core::hf_stream_supported()) {
+            std::fprintf(stderr, "strata generate: --hf-stream-vram: this engine was built without libcurl\n");
+            return 2;
+        }
+        if (o.native_preset.empty() || o.hf_stream_url.empty()) {
+            std::fprintf(stderr, "strata generate: --hf-stream-vram needs --native PATH and --hf-stream-url URL\n");
+            return 2;
+        }
+        if (!o.serve) {
+            std::fprintf(stderr, "strata generate: --hf-stream-vram is a serving mode (--serve): a one-shot run has no "
+                                 "READY point at which the download is complete\n");
+            return 2;
+        }
+        if (o.resident_cpu_experts || o.resident_budget > 0 || o.resident_pin) {
+            std::fprintf(stderr, "strata generate: --hf-stream-vram does not support the resident expert arena "
+                                 "(--resident-experts / --resident-budget-gib): it reads the whole GGUF before the arena\n");
+            return 2;
+        }
+        strata::core::HfStreamOptions sopts;
+        sopts.url = o.hf_stream_url;
+        sopts.path = o.native_preset;
+        sopts.token = o.hf_stream_token;
+        sopts.threads = o.hf_stream_threads;
+        sopts.chunk_bytes = (uint64_t) o.hf_stream_chunk_mb << 20;
+        sopts.disk_tee = o.hf_stream_disk_mode != "none";
+        std::string hf_err;
+        if (!strata::core::hf_stream_start(sopts, hf_err)) {
+            std::fprintf(stderr, "strata generate: --hf-stream-vram: %s\n", hf_err.c_str());
+            return 2;
+        }
+    }
     if (!o.native_preset.empty()) {
         try {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native).  A missing shard is an error
@@ -15716,6 +15809,14 @@ int main(int argc, char** argv) {
                         std::abort();
                     }
                 }).detach();
+        }
+        if (o.hf_stream_vram) {
+            std::string hf_err;
+            if (!strata::core::hf_stream_finish(hf_err)) {
+                std::fprintf(stderr, "strata generate: --hf-stream-vram: %s\n", hf_err.c_str());
+                return 1;
+            }
+            if (o.hf_stream_disk_mode != "none") strata::core::hf_stream_reset();
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom

@@ -205,6 +205,14 @@ request: [SOURCE_INSTALL.md](SOURCE_INSTALL.md#build-from-git-on-linux-to-try-a-
 
 ---
 
+### Downloading straight into VRAM (`--hf-stream-vram`, opt-in)
+
+The native Flash-Next path can fetch the metadata shard over HTTP Range while it loads it, instead of downloading
+the whole GGUF first and reading it again. The dense projections, the output head and the startup expert-cache
+fill consume the arriving chunks; the file is still written to `--native`'s path for the next start (`none` skips
+the disk copy). It needs a libcurl build and a server that answers `206` to Range requests. See
+[HF_STREAM_VRAM.md](HF_STREAM_VRAM.md) for the flags, the limits and the measured behavior.
+
 ### Downloading the model files yourself
 
 Setup downloads the model files over 16 connections (`STRATA_DL_CONNECTIONS` 1 to 32), resumes a stopped download, and checks every file's SHA-256 against the

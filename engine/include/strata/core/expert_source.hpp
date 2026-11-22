@@ -22,6 +22,7 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/hf_stream.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
@@ -1187,6 +1188,10 @@ private:
     int64_t ram_adapts_ = 0;                  ///< replace_resident(_staged): experts moved into the compact copy
     int64_t ram_staged_ = 0;                  ///< replace_resident_staged: of those, copied out of a stage buffer
     std::vector<uint8_t> ram_adapt_buf_;      ///< ...one blob, read here before it replaces another
+    /// --hf-stream-vram: one blob assembled from the arriving GGUF bytes (blob_stable, startup profile fill only;
+    /// the fill copies it before the next call, and the READY wait has every chunk on disk).
+    mutable std::mutex hf_mu_;
+    mutable std::vector<uint8_t> hf_blob_;
     // 149-prefetch: the staged promotions (ram_stage / ram_install)
     struct RamJob { int64_t layer, in, out; std::vector<uint8_t> buf; int state; };   ///< state 0 queued, 1 reading, 2 landed, 3 failed
     mutable std::mutex ram_mu_;

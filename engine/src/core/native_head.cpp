@@ -5,6 +5,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/vhead_bitplane.hpp"
+#include "strata/core/hf_stream.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
@@ -15,6 +16,17 @@
 #include <exception>
 
 namespace strata::core {
+
+namespace {
+// With --hf-stream-vram the file is still being written: a mapping would see the sparse holes as zeros.  This
+// copies the tensor's bytes through the stream; without a stream it is the same memcpy as before.
+bool tensor_bytes(const strata::GgufFile& gguf, const strata::TensorInfo& t, void* dst, uint64_t bytes,
+                  std::string& err) {
+    if (hf_stream_active(gguf.path())) return hf_stream_read(gguf.path(), gguf.data_start() + t.offset, dst, bytes, err);
+    std::memcpy(dst, gguf.tensor_data(t), (size_t) bytes);
+    return true;
+}
+}  // namespace
 
 NativeHead::~NativeHead() {
     unload();
@@ -74,7 +86,7 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
             void* hp = nullptr;
             void* dp = nullptr;
             if (cudaHostAlloc(&hp, bytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess && cudaHostGetDevicePointer(&dp, hp, 0) == cudaSuccess) {
-                std::memcpy(hp, gguf.tensor_data(*tensor), bytes);
+                if (!tensor_bytes(gguf, *tensor, hp, bytes, err)) { cudaFreeHost(hp); return false; }
                 host = hp;
                 weights = dp;
                 status = cudaSuccess;
@@ -87,15 +99,23 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         }
         if (status == cudaSuccess)
             status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
-        if (status == cudaSuccess && host == nullptr)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+        if (!hf_stream_active(gguf.path())) strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
+        if (status == cudaSuccess && host == nullptr) {
+            if (hf_stream_active(gguf.path())) {
+                std::vector<uint8_t> stage((size_t) bytes);
+                status = tensor_bytes(gguf, *tensor, stage.data(), bytes, err)
+                             ? cudaMemcpy(weights, stage.data(), bytes, cudaMemcpyHostToDevice)
+                             : cudaErrorInvalidValue;
+            } else {
+                status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
+            }
+        }
         if (status != cudaSuccess) {
             if (host) cudaFreeHost(host);
             weights = host ? nullptr : weights;
             if (scratch) cudaFree(scratch);
             if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + cudaGetErrorString(status);
+            if (err.empty()) err = std::string("native head upload: ") + cudaGetErrorString(status);
             return false;
         }
         weights_ = weights;
@@ -226,7 +246,8 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             bytes_ = 0;
             return false;
         }
-        strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
+        const bool hf_stream = hf_stream_active(gguf.path());
+        if (!hf_stream) strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
         // STRATA_EMBED_VRAM=1: the table in the current device's VRAM instead of mapped host memory. The same
         // bytes, read by the same gather kernels through dev_ (bitwise the same rows); what changes is where a
         // prompt's scattered row reads go: over a PCIe Gen2 x4 link they cost more than the table's size in VRAM
@@ -238,7 +259,14 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             void* d = nullptr;
             if (have_free && (uint64_t) free_b > bytes_ + ((uint64_t) 512 << 20) &&
                 cudaMalloc(&d, bytes_) == cudaSuccess) {
-                if (cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) == cudaSuccess) {
+                std::vector<uint8_t> stage;
+                const void* src = gguf.tensor_data(*t);
+                if (hf_stream) {
+                    stage.resize((size_t) bytes_);
+                    if (!tensor_bytes(gguf, *t, stage.data(), bytes_, err)) { cudaFree(d); return false; }
+                    src = stage.data();
+                }
+                if (cudaMemcpy(d, src, bytes_, cudaMemcpyHostToDevice) == cudaSuccess) {
                     std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
                                          "(%llu MiB were free)\n",
                                  (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
@@ -263,8 +291,15 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             cudaGetLastError();
             host_ = nullptr;
             void* d = nullptr;
+            std::vector<uint8_t> stage;
+            const void* src = gguf.tensor_data(*t);
+            if (hf_stream) {
+                stage.resize((size_t) bytes_);
+                if (!tensor_bytes(gguf, *t, stage.data(), bytes_, err)) return false;
+                src = stage.data();
+            }
             if (cudaMalloc(&d, bytes_) != cudaSuccess ||
-                cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+                cudaMemcpy(d, src, bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
                 if (d) cudaFree(d);
                 cudaGetLastError();
                 err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB: " +
@@ -275,7 +310,7 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
                          (unsigned long long) (bytes_ >> 20));
             dev_ = d;
         } else {
-            std::memcpy(host_, gguf.tensor_data(*t), bytes_);
+            if (!tensor_bytes(gguf, *t, host_, bytes_, err)) { cudaFreeHost(host_); host_ = nullptr; return false; }
             void* d = nullptr;
 #if defined(STRATA_USE_HIP)
             // #325: the Windows HIP stack can refuse the device alias of a mapped allocation (and, when it gives
@@ -285,8 +320,15 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess || d == nullptr) {
                 cudaGetLastError();
                 d = nullptr;
+                std::vector<uint8_t> stage;
+                const void* src = gguf.tensor_data(*t);
+                if (hf_stream) {
+                    stage.resize((size_t) bytes_);
+                    if (!tensor_bytes(gguf, *t, stage.data(), bytes_, err)) return false;
+                    src = stage.data();
+                }
                 if (cudaMalloc(&d, bytes_) != cudaSuccess ||
-                    cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    cudaMemcpy(d, src, bytes_, cudaMemcpyHostToDevice) != cudaSuccess) {
                     if (d) cudaFree(d);
                     cudaGetLastError();
                     err = "native embedding: no device alias for the mapped table, and no VRAM to copy it into";
