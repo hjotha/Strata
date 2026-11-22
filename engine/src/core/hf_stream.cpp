@@ -24,12 +24,14 @@
 #endif
 
 #if defined(_WIN32)
+#include <fcntl.h>
 #include <io.h>
 #define strata_open _open
 #define strata_close _close
-#define strata_pread _read
-#define strata_pwrite _write
 #define strata_fsync _commit
+#define STRATA_O_RDWR _O_RDWR
+#define STRATA_O_CREAT _O_CREAT
+#define STRATA_O_TRUNC _O_TRUNC
 #else
 #include <fcntl.h>
 #include <unistd.h>
@@ -48,12 +50,22 @@ constexpr uint64_t kMaxChunk = 64ull << 20;
 constexpr int kMaxThreads = 32;
 constexpr size_t kCacheChunks = 32;   // 32 x 8 MiB = 256 MiB at the default chunk
 
+#if defined(_WIN32)
+// Windows has no pread/pwrite: the shared descriptor's offset is moved under one lock.  The feature is exercised
+// on Linux; this keeps the Windows build correct rather than silently reading from the descriptor's current offset.
+std::mutex g_win_fd_mu;
+#endif
+
 bool pread_full(int fd, void* dst, uint64_t bytes, uint64_t off) {
     uint8_t* p = static_cast<uint8_t*>(dst);
     uint64_t done = 0;
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lock(g_win_fd_mu);
+    if (_lseeki64(fd, (long long) off, SEEK_SET) < 0) return false;
+#endif
     while (done < bytes) {
 #if defined(_WIN32)
-        const int n = strata_pread(fd, p + done, (unsigned) std::min<uint64_t>(bytes - done, 1u << 30), (long) (off + done));
+        const int n = _read(fd, p + done, (unsigned) std::min<uint64_t>(bytes - done, 1u << 30));
 #else
         const ssize_t n = strata_pread(fd, p + done, (size_t) (bytes - done), (off_t) (off + done));
 #endif
@@ -66,9 +78,13 @@ bool pread_full(int fd, void* dst, uint64_t bytes, uint64_t off) {
 bool pwrite_full(int fd, const void* src, uint64_t bytes, uint64_t off) {
     const uint8_t* p = static_cast<const uint8_t*>(src);
     uint64_t done = 0;
+#if defined(_WIN32)
+    std::lock_guard<std::mutex> lock(g_win_fd_mu);
+    if (_lseeki64(fd, (long long) off, SEEK_SET) < 0) return false;
+#endif
     while (done < bytes) {
 #if defined(_WIN32)
-        const int n = strata_pwrite(fd, p + done, (unsigned) std::min<uint64_t>(bytes - done, 1u << 30), (long) (off + done));
+        const int n = _write(fd, p + done, (unsigned) std::min<uint64_t>(bytes - done, 1u << 30));
 #else
         const ssize_t n = strata_pwrite(fd, p + done, (size_t) (bytes - done), (off_t) (off + done));
 #endif
@@ -317,7 +333,11 @@ bool HfStream::start(const HfStreamOptions& opts, std::string& err) {
 
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(opts.path).parent_path(), ec);
+#if defined(_WIN32)
+    impl_->fd = strata_open(opts.path.c_str(), STRATA_O_RDWR | STRATA_O_CREAT | STRATA_O_TRUNC, 0644);
+#else
     impl_->fd = strata_open(opts.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+#endif
     if (impl_->fd < 0) { err = "hf stream: cannot create " + opts.path; return false; }
 #if defined(_WIN32)
     if (_chsize_s(impl_->fd, (long long) impl_->total) != 0) { err = "hf stream: cannot size " + opts.path; return false; }
